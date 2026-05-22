@@ -1,0 +1,198 @@
+-- =============================================================================
+-- Flash Report Web App — Snowflake Setup
+-- =============================================================================
+-- Run as: SECURITYADMIN (for role/user creation) + SYSADMIN (for schema/grants)
+-- Or:     ACCOUNTADMIN (covers both)
+--
+-- This script is idempotent. Safe to re-run.
+--
+-- BEFORE RUNNING — fill in or confirm these placeholders:
+--   <SOURCE_DATABASE>        e.g. ANALYTICS
+--   <SOURCE_SCHEMA>          e.g. MARKETING — wherever Tableau source tables live
+--   <SOURCE_TABLE_CONTENT>   e.g. CONTENT_CONSUMPTION — actual table feeding the Tableau dashboard
+--   <WAREHOUSE_NAME>         e.g. REPORTING_WH — existing warehouse the service user will use
+--   <RSA_PUBLIC_KEY>         the public half of an RSA key pair (see generation instructions below)
+--
+-- GENERATING THE RSA KEY PAIR (run locally before this script):
+--   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out snowflake_rsa_key.p8 -nocrypt
+--   openssl rsa -in snowflake_rsa_key.p8 -pubout -out snowflake_rsa_key.pub
+--   The .pub file's contents (minus the BEGIN/END lines) go into <RSA_PUBLIC_KEY> below.
+--   The .p8 file is the private key — give that to the app, never check into git.
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- 1. Create the role
+-- -----------------------------------------------------------------------------
+USE ROLE SECURITYADMIN;
+
+CREATE ROLE IF NOT EXISTS FLASH_REPORTER_ROLE
+    COMMENT = 'Service role for the Marketing Flash Report web app. Read-only on source data, write access to FLASH_REPORT schema only.';
+
+
+-- -----------------------------------------------------------------------------
+-- 2. Create the service user with key-pair auth
+-- -----------------------------------------------------------------------------
+CREATE USER IF NOT EXISTS SVC_FLASH_REPORTER
+    DEFAULT_ROLE = FLASH_REPORTER_ROLE
+    DEFAULT_WAREHOUSE = <WAREHOUSE_NAME>
+    DEFAULT_NAMESPACE = '<SOURCE_DATABASE>.FLASH_REPORT'
+    COMMENT = 'Service account for the Marketing Flash Report web app. Auth via RSA key-pair only.'
+    MUST_CHANGE_PASSWORD = FALSE
+    DISABLED = FALSE;
+
+-- Attach the RSA public key for key-pair authentication.
+-- Paste the public key contents below as a single line, no header/footer.
+ALTER USER SVC_FLASH_REPORTER SET RSA_PUBLIC_KEY = '<RSA_PUBLIC_KEY>';
+
+-- Grant the role to the user
+GRANT ROLE FLASH_REPORTER_ROLE TO USER SVC_FLASH_REPORTER;
+
+
+-- -----------------------------------------------------------------------------
+-- 3. Warehouse usage
+-- -----------------------------------------------------------------------------
+USE ROLE SYSADMIN;
+
+GRANT USAGE ON WAREHOUSE <WAREHOUSE_NAME> TO ROLE FLASH_REPORTER_ROLE;
+
+
+-- -----------------------------------------------------------------------------
+-- 4. Read-only access to source data (Tableau-curated tables)
+-- -----------------------------------------------------------------------------
+GRANT USAGE ON DATABASE <SOURCE_DATABASE> TO ROLE FLASH_REPORTER_ROLE;
+GRANT USAGE ON SCHEMA <SOURCE_DATABASE>.<SOURCE_SCHEMA> TO ROLE FLASH_REPORTER_ROLE;
+
+-- Grant SELECT on the specific content consumption table(s).
+-- If multiple tables feed the dashboard, repeat this GRANT for each.
+GRANT SELECT ON TABLE <SOURCE_DATABASE>.<SOURCE_SCHEMA>.<SOURCE_TABLE_CONTENT>
+    TO ROLE FLASH_REPORTER_ROLE;
+
+-- Future-proof: if new content tables are added to this schema, auto-grant SELECT
+-- (Optional — comment out if your org doesn't allow future grants)
+GRANT SELECT ON FUTURE TABLES IN SCHEMA <SOURCE_DATABASE>.<SOURCE_SCHEMA>
+    TO ROLE FLASH_REPORTER_ROLE;
+
+
+-- -----------------------------------------------------------------------------
+-- 5. Create the FLASH_REPORT schema (where the app writes)
+-- -----------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS <SOURCE_DATABASE>.FLASH_REPORT
+    COMMENT = 'Output schema for the Marketing Flash Report web app. Written to by SVC_FLASH_REPORTER only.';
+
+GRANT USAGE ON SCHEMA <SOURCE_DATABASE>.FLASH_REPORT TO ROLE FLASH_REPORTER_ROLE;
+GRANT CREATE TABLE ON SCHEMA <SOURCE_DATABASE>.FLASH_REPORT TO ROLE FLASH_REPORTER_ROLE;
+GRANT CREATE VIEW ON SCHEMA <SOURCE_DATABASE>.FLASH_REPORT TO ROLE FLASH_REPORTER_ROLE;
+
+
+-- -----------------------------------------------------------------------------
+-- 6. Create the app's tables
+-- -----------------------------------------------------------------------------
+USE ROLE FLASH_REPORTER_ROLE;
+USE DATABASE <SOURCE_DATABASE>;
+USE SCHEMA FLASH_REPORT;
+
+-- 6a. WEEKLY_METRICS — canonical home for every ingested metric
+CREATE TABLE IF NOT EXISTS WEEKLY_METRICS (
+    fiscal_year         NUMBER(4)    NOT NULL,
+    fiscal_quarter      NUMBER(1)    NOT NULL,
+    fiscal_week         NUMBER(2)    NOT NULL,
+    week_start_date     DATE         NOT NULL,
+    week_end_date       DATE         NOT NULL,
+    source_platform     VARCHAR(64)  NOT NULL,   -- 'GA4', 'UMAMI', 'SALESFORCE', 'TABLEAU_CONTENT'
+    metric_name         VARCHAR(128) NOT NULL,   -- 'web_sessions', 'mql_count', 'gated_downloads', etc.
+    metric_value        FLOAT,                   -- nullable for stale/missing data
+    granularity         VARCHAR(16)  NOT NULL,   -- 'WEEKLY', 'QTD', 'YTD'
+    is_stale            BOOLEAN      DEFAULT FALSE,
+    ingested_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_weekly_metrics PRIMARY KEY (fiscal_year, fiscal_quarter, fiscal_week, source_platform, metric_name, granularity)
+);
+
+-- 6b. TARGETS — KPI goals, refreshed manually each quarter
+CREATE TABLE IF NOT EXISTS TARGETS (
+    fiscal_year         NUMBER(4)    NOT NULL,
+    fiscal_quarter      NUMBER(1),               -- nullable for annual-only targets
+    metric_name         VARCHAR(128) NOT NULL,
+    target_type         VARCHAR(16)  NOT NULL,   -- 'ANNUAL', 'QUARTERLY', 'WEEKLY'
+    target_value        FLOAT        NOT NULL,
+    seasonality_pct     FLOAT,                   -- e.g. 0.27 for Q1 (27% of annual)
+    notes               VARCHAR(512),
+    updated_at          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_targets PRIMARY KEY (fiscal_year, fiscal_quarter, metric_name, target_type)
+);
+
+-- 6c. NARRATIVES — Claude-authored commentary, versioned per week
+CREATE TABLE IF NOT EXISTS NARRATIVES (
+    narrative_id        VARCHAR(36)  DEFAULT UUID_STRING() NOT NULL,
+    fiscal_year         NUMBER(4)    NOT NULL,
+    fiscal_quarter      NUMBER(1)    NOT NULL,
+    fiscal_week         NUMBER(2)    NOT NULL,
+    version             NUMBER       NOT NULL,
+    is_scheduled        BOOLEAN      NOT NULL,   -- TRUE = Monday auto-gen, FALSE = on-demand
+    generated_at        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    generated_by        VARCHAR(256),            -- email of user who triggered, or 'SYSTEM'
+    prompt_overlay      VARCHAR(2048),           -- custom user instruction, if any
+    tone                VARCHAR(32),             -- 'executive', 'analytical', 'brief', or NULL
+    narrative_text      VARCHAR(16777216),       -- VARCHAR max — the full narrative body
+    status              VARCHAR(16)  DEFAULT 'active',  -- 'active', 'failed', 'superseded'
+    model_used          VARCHAR(64),
+    input_tokens        NUMBER,
+    output_tokens       NUMBER,
+    CONSTRAINT pk_narratives PRIMARY KEY (narrative_id)
+);
+
+-- 6d. RUN_HISTORY — audit trail for the weekly ingestion job
+CREATE TABLE IF NOT EXISTS RUN_HISTORY (
+    run_id              VARCHAR(36)  DEFAULT UUID_STRING() NOT NULL,
+    fiscal_year         NUMBER(4)    NOT NULL,
+    fiscal_quarter      NUMBER(1)    NOT NULL,
+    fiscal_week         NUMBER(2)    NOT NULL,
+    run_type            VARCHAR(16)  NOT NULL,   -- 'SCHEDULED', 'MANUAL', 'DRY_RUN'
+    started_at          TIMESTAMP_NTZ NOT NULL,
+    completed_at        TIMESTAMP_NTZ,
+    status              VARCHAR(16)  NOT NULL,   -- 'running', 'success', 'partial', 'failed'
+    sources_succeeded   VARCHAR(512),            -- comma-separated list
+    sources_failed      VARCHAR(512),
+    error_details       VARCHAR(4096),
+    CONSTRAINT pk_run_history PRIMARY KEY (run_id)
+);
+
+-- 6e. AUDIT_LOG — per-user actions (narrative regenerations, exports)
+CREATE TABLE IF NOT EXISTS AUDIT_LOG (
+    log_id              VARCHAR(36)  DEFAULT UUID_STRING() NOT NULL,
+    event_at            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() NOT NULL,
+    user_email          VARCHAR(256) NOT NULL,
+    event_type          VARCHAR(64)  NOT NULL,   -- 'narrative_regenerate', 'export_pptx', 'export_xlsx', 'view_report'
+    fiscal_year         NUMBER(4),
+    fiscal_quarter      NUMBER(1),
+    fiscal_week         NUMBER(2),
+    metadata            VARIANT,                 -- flexible payload (prompt overlay, file name, etc.)
+    CONSTRAINT pk_audit_log PRIMARY KEY (log_id)
+);
+
+
+-- -----------------------------------------------------------------------------
+-- 7. Ensure the role can read/write what it created
+-- -----------------------------------------------------------------------------
+USE ROLE SYSADMIN;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA <SOURCE_DATABASE>.FLASH_REPORT
+    TO ROLE FLASH_REPORTER_ROLE;
+GRANT SELECT, INSERT, UPDATE, DELETE ON FUTURE TABLES IN SCHEMA <SOURCE_DATABASE>.FLASH_REPORT
+    TO ROLE FLASH_REPORTER_ROLE;
+
+
+-- -----------------------------------------------------------------------------
+-- 8. Verification — run these after the script completes
+-- -----------------------------------------------------------------------------
+-- Confirm role exists and has the right grants:
+-- SHOW GRANTS TO ROLE FLASH_REPORTER_ROLE;
+--
+-- Confirm user can authenticate (run as SVC_FLASH_REPORTER from app):
+-- SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE();
+--
+-- Confirm the schema and tables exist:
+-- SHOW TABLES IN SCHEMA <SOURCE_DATABASE>.FLASH_REPORT;
+--
+-- Sanity check on source access:
+-- SELECT COUNT(*) FROM <SOURCE_DATABASE>.<SOURCE_SCHEMA>.<SOURCE_TABLE_CONTENT> LIMIT 1;
