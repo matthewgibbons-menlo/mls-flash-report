@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+pip packages
+
+# Environment variables
+.env
+.env.local
+
+# Secrets
+*.p8
+*.key
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

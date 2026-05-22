@@ -1,0 +1,2 @@
+-- Snowflake Setup
+-- Add your Snowflake database setup scripts here
